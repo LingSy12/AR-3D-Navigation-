@@ -1,0 +1,345 @@
+package com.example.appappfcshd;
+
+import android.Manifest;
+import android.content.pm.PackageManager;
+import android.graphics.Color;
+import android.net.Uri;
+import android.os.Bundle;
+import android.util.Log;
+import android.view.View;
+import android.widget.Button;
+import android.widget.ProgressBar;
+import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+
+import com.google.ar.core.ArCoreApk;
+import com.google.ar.core.Config;
+import com.google.ar.core.Plane;
+import com.google.ar.core.Session;
+import com.google.ar.core.TrackingState;
+import com.google.ar.core.exceptions.CameraNotAvailableException;
+import com.google.ar.core.exceptions.UnavailableApkTooOldException;
+import com.google.ar.core.exceptions.UnavailableArcoreNotInstalledException;
+import com.google.ar.core.exceptions.UnavailableDeviceNotCompatibleException;
+import com.google.ar.core.exceptions.UnavailableSdkTooOldException;
+import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException;
+import com.google.ar.sceneform.AnchorNode;
+import com.google.ar.sceneform.assets.RenderableSource;
+import com.google.ar.sceneform.rendering.ModelRenderable;
+import com.google.ar.sceneform.ux.ArFragment;
+import com.google.ar.sceneform.ux.TransformableNode;
+import com.indooratlas.android.sdk.IALocation;
+import com.indooratlas.android.sdk.IALocationListener;
+import com.indooratlas.android.sdk.IALocationManager;
+import com.indooratlas.android.sdk.IALocationRequest;
+
+import java.util.Collection;
+
+public class ARActivity extends AppCompatActivity {
+
+    private static final int CAMERA_PERMISSION_CODE = 100;
+    private static final int LOCATION_PERMISSION_CODE = 101;
+    private static final String TAG = "ARActivity";
+    private Session arSession;
+    private ArFragment arFragment;
+    private TransformableNode modelNode;
+    private ModelRenderable modelRenderable;
+    private Button arButton;
+    private ProgressBar progressBar;
+    private boolean isModelPlaced = false;
+    private static final float MODEL_DISTANCE = 1.0f; // Distance in meters
+    private AnchorNode modelAnchorNode; // Declare modelAnchorNode
+    private IALocationManager iaLocationManager;
+    private IALocationListener iaLocationListener;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_ar);
+
+        arFragment = (ArFragment) getSupportFragmentManager().findFragmentById(R.id.ux_fragment);
+        arButton = findViewById(R.id.ar_button);
+        progressBar = findViewById(R.id.progress_bar);
+
+        arButton.setEnabled(false);  // Disable button initially
+        arButton.setBackgroundColor(Color.GRAY);  // Set button color to gray initially
+        arButton.setText("Loading Model...");  // Initial button text
+
+        // Show the progress bar while the model is loading
+        progressBar.setVisibility(View.VISIBLE);
+
+        // Initialize IndoorAtlas location manager
+        iaLocationManager = IALocationManager.create(this);
+
+        // Create location listener
+        iaLocationListener = new IALocationListener() {
+            @Override
+            public void onLocationChanged(@NonNull IALocation iaLocation) {
+                if (isModelPlaced) {
+                    updateModelPosition(iaLocation);
+                }
+            }
+
+            @Override
+            public void onStatusChanged(String provider, int status, Bundle extras) {
+                // Handle status changes if needed
+            }
+        };
+
+        // Load the 3D model in GLTF or GLB format
+        loadModel();
+
+        requestCameraPermission();
+        requestLocationPermission();
+
+        arFragment.getArSceneView().getScene().addOnUpdateListener(frameTime -> {
+            arFragment.onUpdate(frameTime);
+            if (!isModelPlaced && arFragment.getArSceneView().getArFrame() != null) {
+                Collection<Plane> planes = arFragment.getArSceneView().getArFrame().getUpdatedTrackables(Plane.class);
+                for (Plane plane : planes) {
+                    if (plane.getTrackingState() == TrackingState.TRACKING) {
+                        placeModelInFrontOfCamera();
+                        isModelPlaced = true;
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    private void requestCameraPermission() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.CAMERA},
+                    CAMERA_PERMISSION_CODE);
+        } else {
+            initializeARCoreSession();
+        }
+    }
+
+    private void requestLocationPermission() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.ACCESS_FINE_LOCATION},
+                    LOCATION_PERMISSION_CODE);
+        } else {
+            initializeLocationUpdates();
+        }
+    }
+
+    private void initializeLocationUpdates() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED) {
+            IALocationRequest locationRequest = IALocationRequest.create();
+            locationRequest.setFastestInterval(100); // Set the interval for location updates to 100 milliseconds
+            iaLocationManager.requestLocationUpdates(locationRequest, iaLocationListener);
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        if (requestCode == CAMERA_PERMISSION_CODE) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                initializeARCoreSession();
+            } else {
+                showToastAndFinish("Camera permission is required for AR functionality.");
+            }
+        } else if (requestCode == LOCATION_PERMISSION_CODE) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                initializeLocationUpdates();
+            } else {
+                showToastAndFinish("Location permission is required for AR functionality.");
+            }
+        }
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+    }
+
+    private void initializeARCoreSession() {
+        try {
+            if (!checkARCoreIsSupported()) {
+                return;
+            }
+
+            ArCoreApk.InstallStatus installStatus = ArCoreApk.getInstance().requestInstall(this, true);
+            if (installStatus == ArCoreApk.InstallStatus.INSTALL_REQUESTED) {
+                return;
+            }
+
+            arSession = new Session(this);
+
+            Config config = new Config(arSession);
+            config.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE);
+            config.setPlaneFindingMode(Config.PlaneFindingMode.HORIZONTAL);
+            config.setFocusMode(Config.FocusMode.AUTO);
+            arSession.configure(config);
+
+            arFragment.getArSceneView().setupSession(arSession);
+
+            Log.d(TAG, "ARCore session initialized");
+
+        } catch (UnavailableArcoreNotInstalledException
+                 | UnavailableApkTooOldException
+                 | UnavailableSdkTooOldException
+                 | UnavailableDeviceNotCompatibleException
+                 | UnavailableUserDeclinedInstallationException e) {
+            showToastAndFinish("ARCore not installed or not supported on this device");
+            Log.e(TAG, "ARCore not installed or not supported on this device", e);
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (arSession == null) {
+            initializeARCoreSession();
+        } else {
+            try {
+                arSession.resume();
+                arFragment.getArSceneView().resume();
+                Log.d(TAG, "ARCore session resumed");
+            } catch (CameraNotAvailableException e) {
+                showToastAndFinish("Camera not available");
+                arSession = null;
+                Log.e(TAG, "Camera not available", e);
+                return;
+            }
+
+            if (!checkARCoreIsSupported()) {
+                return;
+            }
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (arSession != null) {
+            arSession.pause();
+            arFragment.getArSceneView().pause();
+            Log.d(TAG, "ARCore session paused");
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (arSession != null) {
+            arSession.close();
+            arSession = null;
+            Log.d(TAG, "ARCore session closed");
+        }
+        if (iaLocationManager != null) {
+            iaLocationManager.destroy();
+        }
+    }
+
+    private boolean checkARCoreIsSupported() {
+        ArCoreApk.Availability availability = ArCoreApk.getInstance().checkAvailability(this);
+        if (availability.isTransient()) {
+            return false;
+        }
+        if (availability.isSupported()) {
+            Log.d(TAG, "ARCore is supported on this device");
+            return true;
+        }
+        Toast.makeText(this, "ARCore is not supported on this device", Toast.LENGTH_SHORT).show();
+        Log.e(TAG, "ARCore is not supported on this device");
+        return false;
+    }
+
+    private void showToastAndFinish(String message) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
+        finish();
+    }
+
+    private void loadModel() {
+        ModelRenderable.builder()
+                .setSource(
+                        this,
+                        RenderableSource.builder()
+                                .setSource(this, Uri.parse("file:///android_asset/model.glb"), RenderableSource.SourceType.GLB)
+                                .setScale(0.1f)  // Scale the model to appropriate size
+                                .setRecenterMode(RenderableSource.RecenterMode.ROOT)
+                                .build()
+                )
+                .setRegistryId("gendarprotivogazz")
+                .build()
+                .thenAccept(renderable -> {
+                    modelRenderable = renderable;
+                    arButton.setEnabled(true);  // Enable button when model is loaded
+                    arButton.setBackgroundColor(Color.GREEN);  // Set button color to green when model is loaded
+                    arButton.setText("Show Model");  // Update button text
+                    progressBar.setVisibility(View.GONE);  // Hide the progress bar
+                    Toast.makeText(this, "3D model successfully loaded", Toast.LENGTH_SHORT).show();
+                    Log.d(TAG, "3D model successfully loaded");
+                })
+                .exceptionally(
+                        throwable -> {
+                            Toast.makeText(this, "Unable to load 3D model", Toast.LENGTH_LONG).show();
+                            Log.e(TAG, "Unable to load 3D model", throwable);
+                            arButton.setEnabled(false);  // Disable button on loading failure
+                            arButton.setText("Model Loading Failed");  // Update button text
+                            progressBar.setVisibility(View.GONE);  // Hide the progress bar
+                            return null;
+                        });
+    }
+
+    private void placeModelInFrontOfCamera() {
+        // Create an AnchorNode without an anchor
+        modelNode = new TransformableNode(arFragment.getTransformationSystem());
+        modelNode.setRenderable(modelRenderable);
+
+        // Align the model with the detected plane
+        modelNode.getRotationController().setEnabled(true);
+        modelNode.getRotationController().setRotationRateDegrees(180f); // Optionally adjust the rotation rate
+
+        // Scale the model as needed
+        modelNode.getScaleController().setMinScale(0.3f);
+        modelNode.getScaleController().setMaxScale(0.5f);
+        modelNode.setLocalScale(new com.google.ar.sceneform.math.Vector3(0.1f, 0.1f, 0.1f)); // Adjust the scale as needed
+
+        arFragment.getArSceneView().getScene().addChild(modelNode);
+        updateModelPosition(null);
+    }
+
+
+    private void updateModelPosition(IALocation iaLocation) {
+        if (iaLocation != null) {
+            // Update the model position to maintain a fixed distance from the camera
+            com.google.ar.sceneform.math.Vector3 cameraPosition = arFragment.getArSceneView().getScene().getCamera().getWorldPosition();
+            com.google.ar.sceneform.math.Vector3 forward = arFragment.getArSceneView().getScene().getCamera().getForward();
+
+            // Adjust the position along the Z-axis
+            float zOffset = -0.5f; // Adjust this value to lower the model
+            com.google.ar.sceneform.math.Vector3 position = com.google.ar.sceneform.math.Vector3.add(cameraPosition, forward.scaled(MODEL_DISTANCE));
+            position = com.google.ar.sceneform.math.Vector3.add(position, new com.google.ar.sceneform.math.Vector3(0.0f, -0.5f, zOffset));
+
+            modelNode.setWorldPosition(position);
+
+            // Calculate the rotation to face the camera (optional)
+            modelNode.setLookDirection(forward, com.google.ar.sceneform.math.Vector3.up());
+
+            // Rotate the model by 180 degrees around the Y axis
+            com.google.ar.sceneform.math.Quaternion rotation = com.google.ar.sceneform.math.Quaternion.axisAngle(new com.google.ar.sceneform.math.Vector3(0.0f, 1.0f, 0.0f), 180f);
+            modelNode.setWorldRotation(com.google.ar.sceneform.math.Quaternion.multiply(modelNode.getWorldRotation(), rotation));
+
+            // Update the yellow dot to represent the user's current location
+            // Update or create markers for the destination and path
+            updatePath();
+        }
+    }
+
+
+
+
+    private void updatePath() {
+        // Implement logic to update the path between the user's location and the destination
+        // You can use a list of nodes to represent the path and update their positions based on the user's movement
+    }
+}
